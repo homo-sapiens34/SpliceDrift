@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "splicedrift"
+version = "0.1.0"
+description = "Age-related splicing drift analysis using Bayesian Beta-Binomial regression"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Zoe Chervontseva"},
+]
+keywords = ["splicing", "aging", "RNA-seq", "Bayesian", "beta-binomial"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "pymc>=5.0",
+    "arviz>=0.15",
+    "pandas>=1.5",
+    "numpy>=1.22",
+    "matplotlib>=3.5",
+    "seaborn>=0.12",
+    "tqdm>=4.60",
+    "statsmodels>=0.13",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+]
+
+[project.scripts]
+splicedrift = "splicedrift.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/zchervontseva/SpliceDrift"
+Repository = "https://github.com/zchervontseva/SpliceDrift"
+Issues = "https://github.com/zchervontseva/SpliceDrift/issues"
+
+[tool.setuptools.packages.find]
+include = ["splicedrift*"]
