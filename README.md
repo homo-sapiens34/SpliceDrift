@@ -228,14 +228,6 @@ splicedrift fit -i examples/example_input.tsv -o results.tsv -v
 splicedrift plot-scatter -i results.tsv -o scatter.png
 ```
 
-## Citation
-
-If you use SpliceDrift, please cite:
-
-> Chervontseva Z. (2026). SpliceDrift: Bayesian Beta-Binomial regression
-> for age-related splicing drift analysis.
-> https://github.com/zchervontseva/SpliceDrift
-
 ## License
 
 [MIT](LICENSE)
