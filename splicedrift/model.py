@@ -341,6 +341,29 @@ def fit_single(
 
 
 # ===================================================================
+# _check_diagnostics — lightweight convergence check for batch mode
+# ===================================================================
+def _check_diagnostics(
+    trace: az.InferenceData, rhat_max: float, ess_min: int
+) -> dict:
+    """Quick convergence check on a trace (used by batch :func:`fit`)."""
+    summ = az.summary(
+        trace,
+        var_names=["intercept_mu", "alpha_prime", "intercept_phi", "beta_prime"],
+    )
+    div = trace.sample_stats.get("diverging", None)
+    n_div = int(div.values.sum()) if div is not None else 0
+    rhat = summ["r_hat"].to_dict()
+    ess_bulk = summ["ess_bulk"].to_dict()
+    rhat_ok = all((np.isnan(v) or v <= rhat_max) for v in rhat.values())
+    ess_ok = all((np.isnan(v) or v >= ess_min) for v in ess_bulk.values())
+    return {
+        "n_divergences": n_div,
+        "ok": rhat_ok and ess_ok and n_div == 0,
+    }
+
+
+# ===================================================================
 # fit — batch-fit all (event, group) pairs
 # ===================================================================
 def fit(
@@ -365,6 +388,11 @@ def fit(
 ) -> pd.DataFrame:
     """Fit the Beta-Binomial age model to every (event, group) pair.
 
+    Uses a shared PyMC model with ``MutableData`` so the PyTensor
+    computational graph is compiled only once.  Subsequent fits swap
+    data via ``pm.set_data()`` and reuse the cached compiled function,
+    which is dramatically faster for batch runs.
+
     Parameters
     ----------
     df : DataFrame
@@ -388,35 +416,156 @@ def fit(
         df = df.copy()
         df[col_group] = "all"
 
-    groups = list(df.groupby([col_event, col_group]))
-    rows: list[dict] = []
+    group_iter = list(df.groupby([col_event, col_group]))
 
-    common_kw = dict(
-        col_k=col_k,
-        col_N=col_N,
-        col_age=col_age,
-        col_event=col_event,
-        col_group=col_group,
-        min_total=min_total,
-        draws=draws,
-        tune=tune,
-        chains=chains,
-        cores=cores,
-        target_accept=target_accept,
-        random_seed=random_seed,
-        rhat_max=rhat_max,
-        ess_min=ess_min,
-        max_refits=max_refits,
-        quiet=quiet,
-    )
-
-    for (eid, grp), sub in tqdm(groups, desc="Fitting events", disable=quiet):
-        try:
-            result = fit_single(sub, **common_kw)
-            rows.append(result["summary"])
-        except Exception as exc:
-            logger.warning("Skipping event=%s group=%s: %s", eid, grp, exc)
+    # ---- Prepare all subsets -----------------------------------------
+    tasks: list[dict] = []
+    for (eid, grp), sub in group_iter:
+        sub = sub.copy()
+        sub[col_k] = sub[col_k].astype(int)
+        sub[col_N] = sub[col_N].astype(int)
+        sub[col_age] = sub[col_age].astype(float)
+        sub = sub.dropna(subset=[col_k, col_N, col_age])
+        sub = sub[
+            (sub[col_N] >= min_total)
+            & (sub[col_k] >= 0)
+            & (sub[col_k] <= sub[col_N])
+        ].copy()
+        if sub.empty:
+            logger.warning(
+                "Skipping event=%s group=%s: no data after filtering",
+                eid,
+                grp,
+            )
             continue
+        age = sub[col_age].to_numpy(dtype=float)
+        age_mean = float(age.mean())
+        age_std = float(age.std(ddof=0))
+        if age_std == 0:
+            logger.warning(
+                "Skipping event=%s group=%s: zero age variance", eid, grp
+            )
+            continue
+        age_z = (age - age_mean) / age_std
+        tasks.append(
+            {
+                "eid": str(eid),
+                "grp": str(grp),
+                "age_z": age_z,
+                "k_obs": sub[col_k].to_numpy(dtype=int),
+                "N_obs": sub[col_N].to_numpy(dtype=int),
+                "n_samples": int(sub.shape[0]),
+                "age_mean": age_mean,
+                "age_std": age_std,
+            }
+        )
+
+    if not tasks:
+        return pd.DataFrame()
+
+    # ---- Build a shared model with MutableData -----------------------
+    # The PyTensor graph is compiled once on the first pm.sample() call.
+    # Subsequent calls with different data (via pm.set_data) reuse the
+    # cached compiled function, avoiding the ~8 s compilation overhead.
+    t0 = tasks[0]
+    with pm.Model() as shared_model:
+        age_z_var = pm.Data("age_z_data", t0["age_z"])
+        k_var = pm.Data("k_data", t0["k_obs"])
+        N_var = pm.Data("N_data", t0["N_obs"])
+
+        intercept_mu = pm.Normal("intercept_mu", mu=0.0, sigma=1.5)
+        alpha_prime = pm.Normal("alpha_prime", mu=0.0, sigma=1.0)
+        intercept_phi = pm.Normal("intercept_phi", mu=0.0, sigma=1.0)
+        beta_prime = pm.Normal("beta_prime", mu=0.0, sigma=1.0)
+
+        eta = intercept_mu + alpha_prime * age_z_var
+        mu_det = pm.Deterministic("mu", pm.math.sigmoid(eta))
+        log_phi = intercept_phi + beta_prime * age_z_var
+        phi_det = pm.Deterministic("phi", pm.math.exp(log_phi))
+
+        pm.BetaBinomial(
+            "k_obs",
+            n=N_var,
+            alpha=mu_det * phi_det,
+            beta=(1 - mu_det) * phi_det,
+            observed=k_var,
+        )
+
+    # ---- Fit each subset using the shared model ----------------------
+    rows: list[dict] = []
+    for task in tqdm(tasks, desc="Fitting events", disable=quiet):
+        try:
+            with shared_model:
+                pm.set_data(
+                    {
+                        "age_z_data": task["age_z"],
+                        "k_data": task["k_obs"],
+                        "N_data": task["N_obs"],
+                    }
+                )
+                cur_draws = int(draws)
+                cur_tune = int(tune)
+                cur_ta = float(target_accept)
+
+                for attempt in range(max_refits + 1):
+                    trace = pm.sample(
+                        draws=cur_draws,
+                        tune=cur_tune,
+                        chains=chains,
+                        cores=cores,
+                        target_accept=cur_ta,
+                        random_seed=random_seed,
+                        progressbar=not quiet,
+                        compute_convergence_checks=False,
+                    )
+                    diag = _check_diagnostics(trace, rhat_max, ess_min)
+                    if diag["ok"] or attempt == max_refits:
+                        break
+                    logger.warning(
+                        "Diagnostics not OK for event=%s group=%s "
+                        "(attempt %d/%d) — refitting…",
+                        task["eid"],
+                        task["grp"],
+                        attempt + 1,
+                        max_refits + 1,
+                    )
+                    if diag["n_divergences"] > 0:
+                        cur_ta = min(0.99, cur_ta + 0.05)
+                    cur_draws = int(np.ceil(cur_draws * 1.5))
+                    cur_tune = int(np.ceil(cur_tune * 1.25))
+
+            # ---- Extract posteriors ----------------------------------
+            post = trace.posterior
+            ap = post["alpha_prime"].values.reshape(-1)
+            bp = post["beta_prime"].values.reshape(-1)
+            ap_hdi = az.hdi(ap, hdi_prob=0.95)
+            bp_hdi = az.hdi(bp, hdi_prob=0.95)
+
+            rows.append(
+                {
+                    "event_id": task["eid"],
+                    "group": task["grp"],
+                    "n_samples": task["n_samples"],
+                    "age_mean": task["age_mean"],
+                    "age_std": task["age_std"],
+                    "alpha_prime_mean": float(ap.mean()),
+                    "alpha_prime_hdi_lo": float(ap_hdi[0]),
+                    "alpha_prime_hdi_hi": float(ap_hdi[1]),
+                    "P_alpha_prime_gt_0": float((ap > 0).mean()),
+                    "beta_prime_mean": float(bp.mean()),
+                    "beta_prime_hdi_lo": float(bp_hdi[0]),
+                    "beta_prime_hdi_hi": float(bp_hdi[1]),
+                    "P_beta_prime_lt_0": float((bp < 0).mean()),
+                    "diagnostics_ok": diag["ok"],
+                }
+            )
+        except Exception as exc:
+            logger.warning(
+                "Skipping event=%s group=%s: %s",
+                task["eid"],
+                task["grp"],
+                exc,
+            )
 
     return pd.DataFrame(rows)
 

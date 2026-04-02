@@ -20,3 +20,5 @@ venv/
 *.pkl
 *.pk
 *.nc
+results.tsv
+scatter.png
