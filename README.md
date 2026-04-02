@@ -48,12 +48,10 @@ Age-related effects are captured through **two key parameters**:
 Together these parameters allow age to influence both the average exon
 inclusion level and the stability of splicing regulation.
 
-> Beta and beta-binomial formulations are standard in alternative splicing
-> analysis (e.g. rMATS and MAJIQ); however, to our knowledge this is the
-> first approach to explicitly introduce linear dependence on age for both
-> the mean and dispersion components of the model.
->
-> — *Chervontseva, Interim Report #1 (December 2025)*
+Beta and beta-binomial formulations are standard in alternative splicing
+analysis (e.g. rMATS and MAJIQ); however, to our knowledge this is the
+first approach to explicitly introduce linear dependence on age for both
+the mean and dispersion components of the model.
 
 The model is fitted using Markov Chain Monte Carlo (MCMC) via
 [PyMC](https://www.pymc.io/).  Convergence is checked automatically
